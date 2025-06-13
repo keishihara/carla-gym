@@ -1,0 +1,17 @@
+__pycache__/
+**/__pycache__
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+
+logs/
+outputs/
+wandb/
+*.pyc
+
+.vscode/settings.json
+carla_gym/envs/__pycache__/__init__.cpython-37.pyc
+.cursor/
+
+*.h5
