@@ -30,7 +30,7 @@ DEFAULT_NUM_NPC_WALKERS = {
 }
 
 
-class DynamicCarlaEnv(CarlaEnv):
+class DynamicEnv(CarlaEnv):
     def __init__(
         self,
         map_name: str = "Town01",

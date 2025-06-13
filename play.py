@@ -1,13 +1,10 @@
 import argparse
 import time
-import warnings
 
 import gymnasium as gym
 from PIL import Image
 
 from carla_gym.wrappers.simple_state_action_wrapper import SimpleStateActionWrapper
-
-warnings.filterwarnings("ignore", category=UserWarning, module="gymnasium.utils.passive_env_checker")
 
 
 def main():
@@ -20,7 +17,7 @@ def main():
 
     try:
         env = gym.make(
-            "carla_gym:DynamicCarlaEnv-v1",
+            "carla_gym:DynamicEnv-v1",
             map_name=args.map,
             gpu_id=args.gpu_id,
             nullrhi=args.cpu,

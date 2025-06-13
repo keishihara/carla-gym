@@ -6,18 +6,8 @@ CARLA_GYM_ROOT_DIR = Path(__file__).resolve().parent
 
 # Declare available environments with a brief description
 _AVAILABLE_ENVS = {
-    "Endless-v1": {
-        "entry_point": "carla_gym.v1.envs:EndlessEnv",
-        "description": "Endless env for RL training and testing",
-        "kwargs": {
-            "map_name": "Town01",
-            "weather_group": "dynamic_1.0",
-            "num_npc_vehicles": [0, 100],
-            "num_npc_walkers": [0, 100],
-        },
-    },
-    "DynamicCarlaEnv-v1": {
-        "entry_point": "carla_gym.envs:DynamicCarlaEnv",
+    "DynamicEnv-v1": {
+        "entry_point": "carla_gym.envs:DynamicEnv",
         "description": "Dynamic env for RL training and testing",
         "kwargs": {
             "map_name": "Town01",
