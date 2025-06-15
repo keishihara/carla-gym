@@ -9,12 +9,6 @@ _AVAILABLE_ENVS = {
     "DynamicEnv-v1": {
         "entry_point": "carla_gym.envs:DynamicEnv",
         "description": "Dynamic env for RL training and testing",
-        "kwargs": {
-            "map_name": "Town01",
-            "weather_group": "dynamic_1.0",
-            "num_npc_vehicles": [0, 120],
-            "num_npc_walkers": [0, 120],
-        },
     },
 }
 

@@ -1,4 +1,11 @@
-from __future__ import annotations
+"""
+SimpleStateActionWrapper
+------------------------
+Flattens selected CARLA observations into a single vector and, optionally,
+exposes an ``(acc, steer)`` action interface (acc ∈ [−1, 1]).
+"""
+
+from collections.abc import Sequence
 
 import carla
 import cv2
@@ -9,7 +16,7 @@ from carla_gym.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-DEFAULT_NUM_NPC_VEHICLES = {
+DEFAULT_NUM_NPC_VEHICLES: dict[str, int] = {
     "Town01": 120,
     "Town02": 70,
     "Town03": 70,
@@ -22,7 +29,7 @@ DEFAULT_NUM_NPC_VEHICLES = {
     "Town13": 120,
     "Town15": 70,
 }
-DEFAULT_NUM_NPC_WALKERS = {
+DEFAULT_NUM_NPC_WALKERS: dict[str, int] = {
     "Town01": 120,
     "Town02": 70,
     "Town03": 70,
@@ -36,484 +43,222 @@ DEFAULT_NUM_NPC_WALKERS = {
     "Town15": 70,
 }
 
+_OBS_EXTRACTORS = {
+    "speed": lambda o: o["speed"]["speed_xy"],
+    "speed_limit": lambda o: o["control"]["speed_limit"],
+    "control": lambda o: np.array(
+        [
+            o["control"]["throttle"],
+            o["control"]["steer"],
+            o["control"]["brake"],
+            o["control"]["gear"] / 5.0,
+        ],
+        dtype=np.float32,
+    ),
+    "acc_xy": lambda o: o["velocity"]["acc_xy"],
+    "vel_xy": lambda o: o["velocity"]["vel_xy"],
+    "vel_ang_z": lambda o: o["velocity"]["vel_ang_z"],
+}
+
+
+def _extract_space(space: gym.spaces.Dict, key: str) -> gym.spaces.Box:  # type: ignore[override]
+    if key in space:
+        sub = space[key]
+        if isinstance(sub, gym.spaces.Box):
+            return sub
+        raise ValueError(f"'{key}' should be Box, got {type(sub).__name__}.")
+    raise KeyError(key)
+
+
+def _fmt(arr) -> str:
+    return (
+        np.array2string(np.asarray(arr), precision=2, separator=",", suppress_small=True) if arr is not None else "N/A"
+    )
+
+
+def _put(img: np.ndarray, txt: str, org: tuple[int, int], scale: float):
+    cv2.putText(img, txt, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 1)
+
+
+def _font(target: int, it: int = 10) -> float:
+    s = 1.0
+    for _ in range(it):
+        h = cv2.getTextSize("Ay", cv2.FONT_HERSHEY_SIMPLEX, s, 1)[0][1]
+        if abs(h - target) < 1:
+            break
+        s *= target / h
+    return s
+
 
 class SimpleStateActionWrapper(gym.Wrapper):
-    def __init__(self, env: gym.Env, input_states: list[str] | None = None, acc_as_action: bool = True):
+    """Flatten observation dict and remap action space."""
+
+    def __init__(
+        self,
+        env: gym.Env,
+        *,
+        input_states: Sequence[str] | None = None,
+        acc_as_action: bool = True,
+    ) -> None:
         super().__init__(env)
-        self._input_states = input_states or ["control", "vel_xy"]
-        self._acc_as_action = acc_as_action
-        self._render_dict = {}
+        self.input_states: tuple[str, ...] = tuple(input_states or ("control", "vel_xy"))
+        self.acc_as_action: bool = acc_as_action
+        self.eval_mode: bool = False
 
-        state_spaces: list[gym.spaces.Box] = []
-        if "speed" in self._input_states:
-            state_spaces.append(self.observation_space["speed"]["speed_xy"])
-        if "speed_limit" in self._input_states:
-            state_spaces.append(self.observation_space["control"]["speed_limit"])
-        if "control" in self._input_states:
-            state_spaces.append(self.observation_space["control"]["throttle"])
-            state_spaces.append(self.observation_space["control"]["steer"])
-            state_spaces.append(self.observation_space["control"]["brake"])
-            state_spaces.append(self.observation_space["control"]["gear"])
-        if "acc_xy" in self._input_states:
-            state_spaces.append(self.observation_space["velocity"]["acc_xy"])
-        if "vel_xy" in self._input_states:
-            state_spaces.append(self.observation_space["velocity"]["vel_xy"])
-        if "vel_ang_z" in self._input_states:
-            state_spaces.append(self.observation_space["velocity"]["vel_ang_z"])
-
-        state_low = np.concatenate([s.low for s in state_spaces])
-        state_high = np.concatenate([s.high for s in state_spaces])
-
+        low, high = self._state_bounds()
         self.observation_space = gym.spaces.Dict(
             {
-                "state": gym.spaces.Box(low=state_low, high=state_high, dtype=np.float32),
+                "state": gym.spaces.Box(low, high, dtype=np.float32),
                 "birdview": self.observation_space["birdview"]["masks"],
             }
         )
-
-        if self._acc_as_action:
-            # act: acc(throttle/brake), steer
-            self.action_space = gym.spaces.Box(low=np.array([-1, -1]), high=np.array([1, 1]), dtype=np.float32)
+        if self.acc_as_action:
+            self.action_space = gym.spaces.Box(
+                low=np.array([-1.0, -1.0], dtype=np.float32),
+                high=np.array([1.0, 1.0], dtype=np.float32),
+                dtype=np.float32,
+            )
         else:
-            # act: throttle, steer, brake
-            self.action_space = gym.spaces.Box(low=np.array([0, -1, 0]), high=np.array([1, 1, 1]), dtype=np.float32)
+            self.action_space = gym.spaces.Box(
+                low=np.array([0.0, -1.0, 0.0], dtype=np.float32),
+                high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
+                dtype=np.float32,
+            )
+        self._render: dict[str, object] = {}
 
-        self.eval_mode = False
+    # ------------------------------------------------------------------
+    # Gym API
+    # ------------------------------------------------------------------
 
-    def reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple:
-        self.env.unwrapped.set_task_idx(np.random.choice(self.env.unwrapped.num_tasks))
-        if self.eval_mode:
-            self.env.unwrapped._task["num_npc_vehicles"] = DEFAULT_NUM_NPC_VEHICLES[self.env.unwrapped.carla_map]
-            self.env.unwrapped._task["num_npc_walkers"] = DEFAULT_NUM_NPC_WALKERS[self.env.unwrapped.carla_map]
-            for ev_id in self.env.unwrapped._ev_handler._terminal_configs:
-                self.env.unwrapped._ev_handler._terminal_configs[ev_id]["kwargs"]["eval_mode"] = True
-        else:
-            for ev_id in self.env.unwrapped._ev_handler._terminal_configs:
-                self.env.unwrapped._ev_handler._terminal_configs[ev_id]["kwargs"]["eval_mode"] = False
-
+    def reset(self, *, seed=None, options=None):  # type: ignore[override]
+        # self.env.unwrapped.set_task_idx(np.random.choice(self.env.unwrapped.num_tasks))
+        self._setup_eval_population()
         obs, info = self.env.reset(seed=seed, options=options)
-        action = carla.VehicleControl(manual_gear_shift=True, gear=1)
-        obs, *_ = self.env.step(action)
-        action = carla.VehicleControl(manual_gear_shift=False)
-        obs, *_ = self.env.step(action)
-
+        for ctrl in (
+            carla.VehicleControl(manual_gear_shift=True, gear=1),
+            carla.VehicleControl(manual_gear_shift=False),
+        ):
+            obs, *_ = self.env.step(ctrl)
         self.env.unwrapped._update_timestamp(reset_called=True)
-
-        obs_processed = self.process_obs(obs, self._input_states)
-        self._render_dict.update(
+        proc = self._proc_obs(obs, train=True)
+        self._render.update(
             {
                 "timestamp": self.env.unwrapped.timestamp,
-                "prev_obs": obs_processed,
+                "prev_obs": proc,
                 "prev_im_render": obs["birdview"]["rendered"],
                 "reward_debug": info["info"]["reward_debug"],
                 "terminal_debug": info["info"]["terminal_debug"],
             }
         )
-        return obs_processed, {}
+        return proc, {}
 
-    def step(self, action: dict) -> tuple:
-        action = self.process_act(action, self._acc_as_action)
-        obs, reward, terminated, truncated, info = self.env.step(action)
-
-        self._render_dict = {
+    def step(self, action):  # type: ignore[override]
+        ctrl = self._proc_act(action, train=True)
+        obs, reward, terminated, truncated, info = self.env.step(ctrl)
+        proc = self._proc_obs(obs, train=True)
+        self._render = {
             "timestamp": self.env.unwrapped.timestamp,
-            "obs": self._render_dict["prev_obs"],
-            "prev_obs": obs,
-            "im_render": self._render_dict["prev_im_render"],
+            "obs": self._render["prev_obs"],
+            "prev_obs": proc,
+            "im_render": self._render["prev_im_render"],
             "prev_im_render": obs["birdview"]["rendered"],
-            "action": action,
+            "action": ctrl,
             "reward_debug": info["reward_debug"],
             "terminal_debug": info["terminal_debug"],
         }
-        return obs, reward, terminated, truncated, info
+        return proc, reward, terminated, truncated, info
 
-    def render(self) -> np.ndarray:
-        """
-        train render: used in train_rl.py
-        """
-        self._render_dict["action_value"] = getattr(self, "action_value", None)
-        self._render_dict["action_log_probs"] = getattr(self, "action_log_probs", None)
-        self._render_dict["action_mu"] = getattr(self, "action_mu", None)
-        self._render_dict["action_sigma"] = getattr(self, "action_sigma", None)
-        return self.im_render(self._render_dict)
+    def render(self) -> np.ndarray:  # noqa: D401
+        for k in ("action_value", "action_log_probs", "action_mu", "action_sigma"):
+            self._render[k] = getattr(self, k, None)
+        return self._draw(self._render)
 
-    @staticmethod
-    def im_render(render_dict: dict, font_scale: float = 0.3) -> np.ndarray:
-        im_birdview = render_dict.get("im_render", None)
-        if im_birdview is None:
-            im_birdview = render_dict["prev_im_render"]
-        h, w, c = im_birdview.shape
-        im = np.zeros([h, w * 2, c], dtype=np.uint8)
-        im[:h, :w] = im_birdview
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
 
-        def _get_font_scale_for_height(
-            target_height_pixels: int,
-            font_face=cv2.FONT_HERSHEY_SIMPLEX,
-            thickness=1,
-        ) -> float:
-            test_text = "Ay"
-            font_scale = 1.0
-            for _ in range(10):
-                (_, height), _ = cv2.getTextSize(test_text, font_face, font_scale, thickness)
-                if abs(height - target_height_pixels) < 1:
-                    break
-                font_scale *= target_height_pixels / height
-            return font_scale
+    def _state_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        spaces = []
+        if "speed" in self.input_states:
+            spaces.append(self.observation_space["speed"]["speed_xy"])
+        if "speed_limit" in self.input_states:
+            spaces.append(self.observation_space["control"]["speed_limit"])
+        if "control" in self.input_states:
+            for sub in ("throttle", "steer", "brake", "gear"):
+                spaces.append(self.observation_space["control"][sub])
+        if "acc_xy" in self.input_states:
+            spaces.append(self.observation_space["velocity"]["acc_xy"])
+        if "vel_xy" in self.input_states:
+            spaces.append(self.observation_space["velocity"]["vel_xy"])
+        if "vel_ang_z" in self.input_states:
+            spaces.append(self.observation_space["velocity"]["vel_ang_z"])
+        low = np.concatenate([s.low for s in spaces])
+        high = np.concatenate([s.high for s in spaces])
+        return low, high
 
-        font_scale = _get_font_scale_for_height(int(h * 0.03))
-
-        test_text = "Ay"
-        (_, text_height), baseline = cv2.getTextSize(test_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
-        line_spacing = int(text_height * 1.8)
-
-        def _get_string(render_dict, key):
-            if key in render_dict and isinstance(render_dict[key], np.ndarray):
-                return np.array2string(render_dict[key], precision=2, separator=",", suppress_small=True)
-            return "N/A"
-
-        action_str = _get_string(render_dict, "action")
-        mu_str = _get_string(render_dict, "action_mu")
-        sigma_str = _get_string(render_dict, "action_sigma")
-        state_str = _get_string(render_dict, "obs")
-
-        current_y = text_height + 3
-
-        txt_t = f"step:{render_dict['timestamp']['step']:5}, frame:{render_dict['timestamp']['frame']:5}"
-        im = cv2.putText(im, txt_t, (3, current_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-        current_y += line_spacing
-
-        if (
-            "action_value" in render_dict
-            and render_dict["action_value"] is not None
-            and "action_log_probs" in render_dict
-            and render_dict["action_log_probs"] is not None
-        ):
-            txt_1 = f"a{action_str} v:{render_dict['action_value']:5.2f} p:{render_dict['action_log_probs']:5.2f}"
-            im = cv2.putText(im, txt_1, (3, current_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-            current_y += line_spacing
-
-        txt_2 = f"s{state_str}"
-        im = cv2.putText(im, txt_2, (3, current_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-
-        current_y_right = text_height + 3
-
-        txt_3 = f"a{mu_str} b{sigma_str}"
-        im = cv2.putText(im, txt_3, (w, current_y_right), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-        current_y_right += line_spacing
-
-        for txt in render_dict["reward_debug"]["debug_texts"] + render_dict["terminal_debug"]["debug_texts"]:
-            im = cv2.putText(im, txt, (w, current_y_right), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-            current_y_right += line_spacing
-
-        return im
-
-    @staticmethod
-    def process_obs(obs: dict, input_states: list[str], train: bool = True) -> dict:
-        state_list = []
-        if "speed" in input_states:
-            state_list.append(obs["speed"]["speed_xy"])
-        if "speed_limit" in input_states:
-            state_list.append(obs["control"]["speed_limit"])
-        if "control" in input_states:
-            state_list.append(obs["control"]["throttle"])
-            state_list.append(obs["control"]["steer"])
-            state_list.append(obs["control"]["brake"])
-            state_list.append(obs["control"]["gear"] / 5.0)
-        if "acc_xy" in input_states:
-            state_list.append(obs["velocity"]["acc_xy"])
-        if "vel_xy" in input_states:
-            state_list.append(obs["velocity"]["vel_xy"])
-        if "vel_ang_z" in input_states:
-            state_list.append(obs["velocity"]["vel_ang_z"])
-
-        state = np.concatenate(state_list)
-
-        birdview = obs["birdview"]["masks"]
-
+    def _proc_obs(self, obs: dict, *, train: bool) -> dict:
+        vec = np.concatenate([_OBS_EXTRACTORS[k](obs).flatten() for k in self.input_states]).astype(np.float32)
+        bev = obs["birdview"]["masks"]
         if not train:
-            birdview = np.expand_dims(birdview, 0)
-            state = np.expand_dims(state, 0)
+            vec = vec[None]
+            bev = bev[None]
+        return {"state": vec, "birdview": bev}
 
-        obs_dict = {"state": state.astype(np.float32), "birdview": birdview}
-        return obs_dict
-
-    @staticmethod
-    def process_act(action: dict, acc_as_action: bool, train: bool = True) -> dict:
+    def _proc_act(self, act, *, train: bool):
         if not train:
-            action = action[0]
-        if acc_as_action:
-            acc, steer = action.astype(np.float64)
-            if acc >= 0.0:
-                throttle = acc
-                brake = 0.0
-            else:
-                throttle = 0.0
-                brake = np.abs(acc)
+            act = act[0]
+        act = act.astype(np.float32)
+        if self.acc_as_action:
+            acc, steer = act
+            throttle = max(acc, 0.0)
+            brake = max(-acc, 0.0)
         else:
-            throttle, steer, brake = action.astype(np.float64)
-
-        throttle = np.clip(throttle, 0, 1)
-        steer = np.clip(steer, -1, 1)
-        brake = np.clip(brake, 0, 1)
-        control = carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)
-        return control
-
-
-class SimpleStateActionWrapperNew(gym.Wrapper):
-    def __init__(self, env: gym.Env, input_states: list[str] | None = None, acc_as_action: bool = True):
-        super().__init__(env)
-
-        self._input_states = input_states or ["control", "vel_xy"]
-        self._acc_as_action = acc_as_action
-        self._render_dict = {}
-
-        state_spaces: list[gym.spaces.Box] = []
-        if "speed" in self._input_states:
-            state_spaces.append(self.observation_space["speed"]["speed_xy"])
-        if "speed_limit" in self._input_states:
-            state_spaces.append(self.observation_space["control"]["speed_limit"])
-        if "control" in self._input_states:
-            state_spaces.append(self.observation_space["control"]["throttle"])
-            state_spaces.append(self.observation_space["control"]["steer"])
-            state_spaces.append(self.observation_space["control"]["brake"])
-            state_spaces.append(self.observation_space["control"]["gear"])
-        if "acc_xy" in self._input_states:
-            state_spaces.append(self.observation_space["velocity"]["acc_xy"])
-        if "vel_xy" in self._input_states:
-            state_spaces.append(self.observation_space["velocity"]["vel_xy"])
-        if "vel_ang_z" in self._input_states:
-            state_spaces.append(self.observation_space["velocity"]["vel_ang_z"])
-
-        state_low = np.concatenate([s.low for s in state_spaces])
-        state_high = np.concatenate([s.high for s in state_spaces])
-
-        self.observation_space = gym.spaces.Dict(
-            {
-                "state": gym.spaces.Box(low=state_low, high=state_high, dtype=np.float32),
-                "birdview": self.observation_space["birdview"]["masks"],
-            }
+            throttle, steer, brake = act
+        return carla.VehicleControl(
+            throttle=float(np.clip(throttle, 0.0, 1.0)),
+            steer=float(np.clip(steer, -1.0, 1.0)),
+            brake=float(np.clip(brake, 0.0, 1.0)),
         )
 
-        if self._acc_as_action:
-            # act: acc(throttle/brake), steer
-            self.action_space = gym.spaces.Box(low=np.array([-1, -1]), high=np.array([1, 1]), dtype=np.float32)
-        else:
-            # act: throttle, steer, brake
-            self.action_space = gym.spaces.Box(low=np.array([0, -1, 0]), high=np.array([1, 1, 1]), dtype=np.float32)
-
-        self.eval_mode = False
-
-    def reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple:
-        self.env.unwrapped.set_task_idx(np.random.choice(self.env.unwrapped.num_tasks))
+    def _setup_eval_population(self):
+        task = self.env.unwrapped._task  # pylint: disable=protected-access
+        handler = self.env.unwrapped._ev_handler
         if self.eval_mode:
-            self.env.unwrapped._task["num_npc_vehicles"] = DEFAULT_NUM_NPC_VEHICLES[self.env.unwrapped.carla_map]
-            self.env.unwrapped._task["num_npc_walkers"] = DEFAULT_NUM_NPC_WALKERS[self.env.unwrapped.carla_map]
-            for ev_id in self.env.unwrapped._ev_handler._terminal_configs:
-                self.env.unwrapped._ev_handler._terminal_configs[ev_id]["kwargs"]["eval_mode"] = True
-        else:
-            for ev_id in self.env.unwrapped._ev_handler._terminal_configs:
-                self.env.unwrapped._ev_handler._terminal_configs[ev_id]["kwargs"]["eval_mode"] = False
+            m = self.env.unwrapped.carla_map
+            task["num_npc_vehicles"] = DEFAULT_NUM_NPC_VEHICLES[m]
+            task["num_npc_walkers"] = DEFAULT_NUM_NPC_WALKERS[m]
+        for ev_id in handler._terminal_configs:  # pylint: disable=protected-access
+            handler._terminal_configs[ev_id]["kwargs"]["eval_mode"] = self.eval_mode
 
-        obs, info = self.env.reset(seed=seed, options=options)
-        action = carla.VehicleControl(manual_gear_shift=True, gear=1)
-        obs, *_ = self.env.step(action)
-        action = carla.VehicleControl(manual_gear_shift=False)
-        obs, *_ = self.env.step(action)
-
-        self.env.unwrapped._update_timestamp(reset_called=True)
-        obs_processed = self.process_obs(obs, self._input_states)
-        self._render_dict.update(
-            {
-                "timestamp": self.env.unwrapped.timestamp,
-                "prev_obs": obs_processed,
-                "prev_im_render": obs["birdview"]["rendered"],
-                "reward_debug": info["info"]["reward_debug"],
-                "terminal_debug": info["info"]["terminal_debug"],
-            }
-        )
-        return obs_processed, {}
-
-    def step(self, action: dict) -> tuple:
-        action = self.process_act(action, self._acc_as_action)
-        obs, reward, terminated, truncated, info = self.env.step(action)
-
-        self._render_dict = {
-            "timestamp": self.env.unwrapped.timestamp,
-            "obs": self._render_dict["prev_obs"],
-            "prev_obs": obs,
-            "im_render": self._render_dict["prev_im_render"],
-            "prev_im_render": obs["birdview"]["rendered"],
-            "action": action,
-            "reward_debug": info["reward_debug"],
-            "terminal_debug": info["terminal_debug"],
-        }
-        return obs, reward, terminated, truncated, info
+    # ------------------------------------------------------------------
+    # Drawing
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def process_obs(obs: dict, input_states: list[str], train: bool = True) -> dict:
-        state_list = []
-        if "speed" in input_states:
-            state_list.append(obs["speed"]["speed_xy"])
-        if "speed_limit" in input_states:
-            state_list.append(obs["control"]["speed_limit"])
-        if "control" in input_states:
-            state_list.append(obs["control"]["throttle"])
-            state_list.append(obs["control"]["steer"])
-            state_list.append(obs["control"]["brake"])
-            state_list.append(obs["control"]["gear"] / 5.0)
-        if "acc_xy" in input_states:
-            state_list.append(obs["velocity"]["acc_xy"])
-        if "vel_xy" in input_states:
-            state_list.append(obs["velocity"]["vel_xy"])
-        if "vel_ang_z" in input_states:
-            state_list.append(obs["velocity"]["vel_ang_z"])
-
-        state = np.concatenate(state_list)
-
-        birdview = obs["birdview"]["masks"]
-
-        if not train:
-            birdview = np.expand_dims(birdview, 0)
-            state = np.expand_dims(state, 0)
-
-        obs_dict = {"state": state.astype(np.float32), "birdview": birdview}
-        return obs_dict
-
-    @staticmethod
-    def process_act(action: dict, acc_as_action: bool, train: bool = True) -> dict:
-        if not train:
-            action = action[0]
-        if acc_as_action:
-            acc, steer = action.astype(np.float64)
-            if acc >= 0.0:
-                throttle = acc
-                brake = 0.0
-            else:
-                throttle = 0.0
-                brake = np.abs(acc)
-        else:
-            throttle, steer, brake = action.astype(np.float64)
-
-        throttle = np.clip(throttle, 0, 1)
-        steer = np.clip(steer, -1, 1)
-        brake = np.clip(brake, 0, 1)
-        control = carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)
-        return control
-
-
-class RenderWrapper(gym.Wrapper):
-    def __init__(self, env: gym.Env, input_states: list[str] | None = None, acc_as_action: bool = True):
-        super().__init__(env)
-        self._render_dict = {}
-
-    def reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple:
-        obs, info = self.env.reset(seed=seed, options=options)
-
-        original_obs = self.env.unwrapped._get_observation()["hero"]
-
-        self._render_dict.update(
-            {
-                "timestamp": self.env.unwrapped.timestamp,
-                "prev_obs": obs,
-                "prev_im_render": original_obs["birdview"]["rendered"],
-                "reward_debug": info.get("info", {}).get("reward_debug", {"debug_texts": []}),
-                "terminal_debug": info.get("info", {}).get("terminal_debug", {"debug_texts": []}),
-            }
-        )
-        return obs, info
-
-    def step(self, action: dict) -> tuple:
-        obs, reward, terminated, truncated, info = self.env.step(action)
-
-        original_obs = self.env.unwrapped._get_observation()["hero"]
-        self._render_dict = {
-            "timestamp": self.env.unwrapped.timestamp,
-            "obs": self._render_dict.get("prev_obs", obs),
-            "prev_obs": obs,
-            "im_render": self._render_dict.get("prev_im_render"),
-            "prev_im_render": original_obs["birdview"]["rendered"],
-            "action": action,
-            "reward_debug": info.get("reward_debug", {"debug_texts": []}),
-            "terminal_debug": info.get("terminal_debug", {"debug_texts": []}),
-        }
-        return obs, reward, terminated, truncated, info
-
-    def render(self) -> np.ndarray:
-        """
-        train render: used in train_rl.py
-        """
-        self._render_dict["action_value"] = getattr(self, "action_value", None)
-        self._render_dict["action_log_probs"] = getattr(self, "action_log_probs", None)
-        self._render_dict["action_mu"] = getattr(self, "action_mu", None)
-        self._render_dict["action_sigma"] = getattr(self, "action_sigma", None)
-        return self.im_render(self._render_dict)
-
-    @staticmethod
-    def im_render(render_dict: dict, font_scale: float = 0.3) -> np.ndarray:
-        im_birdview = render_dict.get("im_render", None)
-        if im_birdview is None:
-            im_birdview = render_dict["prev_im_render"]
-        h, w, c = im_birdview.shape
-        im = np.zeros([h, w * 2, c], dtype=np.uint8)
-        im[:h, :w] = im_birdview
-
-        def _get_font_scale_for_height(
-            target_height_pixels: int,
-            font_face=cv2.FONT_HERSHEY_SIMPLEX,
-            thickness=1,
-        ) -> float:
-            test_text = "Ay"
-            font_scale = 1.0
-            for _ in range(10):
-                (_, height), _ = cv2.getTextSize(test_text, font_face, font_scale, thickness)
-                if abs(height - target_height_pixels) < 1:
-                    break
-                font_scale *= target_height_pixels / height
-            return font_scale
-
-        font_scale = _get_font_scale_for_height(int(h * 0.03))
-
-        test_text = "Ay"
-        (_, text_height), baseline = cv2.getTextSize(test_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
-        line_spacing = int(text_height * 1.8)
-
-        def _get_string(render_dict, key):
-            if key in render_dict and isinstance(render_dict[key], np.ndarray):
-                return np.array2string(render_dict[key], precision=2, separator=",", suppress_small=True)
-            return "N/A"
-
-        action_str = _get_string(render_dict, "action")
-        mu_str = _get_string(render_dict, "action_mu")
-        sigma_str = _get_string(render_dict, "action_sigma")
-        state_str = _get_string(render_dict, "obs")
-
-        current_y = text_height + 3
-
-        txt_t = f"step:{render_dict['timestamp']['step']:5}, frame:{render_dict['timestamp']['frame']:5}"
-        im = cv2.putText(im, txt_t, (3, current_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-        current_y += line_spacing
-
-        if (
-            "action_value" in render_dict
-            and render_dict["action_value"] is not None
-            and "action_log_probs" in render_dict
-            and render_dict["action_log_probs"] is not None
-        ):
-            txt_1 = f"a{action_str} v:{render_dict['action_value']:5.2f} p:{render_dict['action_log_probs']:5.2f}"
-            im = cv2.putText(im, txt_1, (3, current_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-            current_y += line_spacing
-
-        txt_2 = f"s{state_str}"
-        im = cv2.putText(im, txt_2, (3, current_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-
-        current_y_right = text_height + 3
-
-        txt_3 = f"a{mu_str} b{sigma_str}"
-        im = cv2.putText(im, txt_3, (w, current_y_right), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-        current_y_right += line_spacing
-
-        for txt in render_dict["reward_debug"]["debug_texts"] + render_dict["terminal_debug"]["debug_texts"]:
-            im = cv2.putText(im, txt, (w, current_y_right), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-            current_y_right += line_spacing
-
-        return im
+    def _draw(r: dict, *, fscale: float | None = None) -> np.ndarray:
+        left = r.get("im_render", r["prev_im_render"])
+        h, w, _ = left.shape
+        canvas = np.zeros((h, w * 2, 3), np.uint8)
+        canvas[:, :w] = left
+        if fscale is None:
+            fscale = _font(int(h * 0.03))
+        th = cv2.getTextSize("Ay", cv2.FONT_HERSHEY_SIMPLEX, fscale, 1)[0][1]
+        lh = int(th * 1.8)
+        y, yr, xr = th + 3, th + 3, w
+        _put(canvas, f"step:{r['timestamp']['step']:5}, frame:{r['timestamp']['frame']:5}", (3, y), fscale)
+        y += lh
+        if r.get("action_value") is not None and r.get("action_log_probs") is not None:
+            _put(
+                canvas,
+                f"a{_fmt(r.get('action'))} v:{r['action_value']:.2f} p:{r['action_log_probs']:.2f}",
+                (3, y),
+                fscale,
+            )
+            y += lh
+        _put(canvas, f"s{_fmt(r.get('obs'))}", (3, y), fscale)
+        _put(canvas, f"a{_fmt(r.get('action_mu'))} b{_fmt(r.get('action_sigma'))}", (xr, yr), fscale)
+        yr += lh
+        for t in r["reward_debug"]["debug_texts"] + r["terminal_debug"]["debug_texts"]:
+            _put(canvas, t, (xr, yr), fscale)
+            yr += lh
+        return canvas

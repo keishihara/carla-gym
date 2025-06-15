@@ -5,7 +5,7 @@ import os
 class RankFormatter(logging.Formatter):
     """Custom formatter that includes rank information from environment variable."""
 
-    def __init__(self, fmt=None, datefmt=None):
+    def __init__(self, fmt=None, datefmt="%Y-%m-%d %H:%M:%S"):
         # Base format without rank
         self.base_fmt = "[%(asctime)s][%(filename)s:%(lineno)d][%(levelname)s] %(message)s"
         # Format with rank
@@ -53,4 +53,3 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger.propagate = False  # Prevent duplicate logs
 
     return logger
-

@@ -19,14 +19,13 @@ from carla_gym.engine.actors.npc.vehicle import NpcVehicleHandler
 from carla_gym.engine.actors.npc.walker import NpcWalkerHandler
 from carla_gym.engine.actors.scenario_actor.scenario_actor_handler import ScenarioActorHandler
 from carla_gym.engine.observation.obs_manager_handler import ObsManagerHandler
+from carla_gym.envs.task_config import TaskConfig
 from carla_gym.runtime.carla_runtime import CarlaRuntime
 from carla_gym.utils.dynamic_weather import WeatherHandler
 from carla_gym.utils.logger import setup_logger
 from carla_gym.utils.traffic_light import TrafficLightHandler
 
 logger = setup_logger(__name__)
-
-# TODO: taskはdataclassで定義すると良さそう
 
 
 class CarlaEnv(gym.Env):
@@ -44,7 +43,7 @@ class CarlaEnv(gym.Env):
         obs_configs: dict | None = None,
         reward_configs: dict | None = None,
         terminal_configs: dict | None = None,
-        all_tasks: dict | None = None,
+        task_config: TaskConfig | None = None,
         render_mode: Literal["human", "rgb_array"] = "rgb_array",
     ):
         self._map_name = map_name
@@ -58,7 +57,7 @@ class CarlaEnv(gym.Env):
         self._obs_configs = obs_configs or {}
         self._reward_configs = reward_configs or {}
         self._terminal_configs = terminal_configs or {}
-        self._all_tasks = all_tasks or {}
+        self._task_config = task_config or TaskConfig.sample(n=1)
 
         self._observation_space = None
         self._action_space = None
@@ -96,7 +95,7 @@ class CarlaEnv(gym.Env):
 
     @property
     def num_tasks(self) -> int:
-        return len(self._all_tasks)
+        return 1
 
     @property
     def task(self) -> dict:
@@ -124,10 +123,13 @@ class CarlaEnv(gym.Env):
     def timestamp(self, value: dict) -> None:
         self._timestamp = value
 
-    def set_task_idx(self, task_idx):
-        self._task_idx = task_idx
-        self._shuffle_task = False
-        self._task = self._all_tasks[self._task_idx].copy()
+    @property
+    def num_npc_vehicles(self) -> int:
+        return self._task["num_npc_vehicles"]
+
+    @property
+    def num_npc_walkers(self) -> int:
+        return self._task["num_npc_walkers"]
 
     def reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple:
         """Reset the environment and return the first observation."""
@@ -150,7 +152,6 @@ class CarlaEnv(gym.Env):
         # Maintain server / client
         server_restarted = self._runtime.ensure_healthy()
         if server_restarted:
-            # タイマーをリセット
             for attr in ("_timestamp", "_world_time"):
                 if hasattr(self, attr):
                     delattr(self, attr)
@@ -161,9 +162,9 @@ class CarlaEnv(gym.Env):
             self._init_handlers()
 
         # Task shuffle
-        if self._shuffle_task:
-            self._task_idx = self._rng.choice(self.num_tasks)
-            self._task = self._all_tasks[self._task_idx].copy()
+        if self._endless_task:
+            self._task_config = TaskConfig.sample(n=1)
+            self._task = self._task_config.to_dict()
 
         # Handlers
         self._reset_handlers()
@@ -199,7 +200,7 @@ class CarlaEnv(gym.Env):
         # Apply control
         control_dict = self._process_action(control)
         self._ev_handler.apply_control(control_dict)
-        self._sa_handler.tick()
+        self._sa_handler.tick(self.timestamp)
 
         # Simulator tick
         self._runtime.world.tick()
@@ -235,6 +236,8 @@ class CarlaEnv(gym.Env):
 
     def close(self) -> None:
         """Release resources; safe to call multiple times."""
+        # TODO: Handle TimeoutException and avoid stucking when closing the environment
+
         with contextlib.suppress(Exception):
             self._clean()
         with contextlib.suppress(Exception):
@@ -300,9 +303,8 @@ class CarlaEnv(gym.Env):
         self._rng = np.random.default_rng(self._seed)
 
         # First task
-        self._task_idx = 0
-        self._shuffle_task = True
-        self._task = self._all_tasks[self._task_idx]
+        self._endless_task = True
+        self._task = self._task_config.to_dict()
 
         # Handlers
         self._init_handlers()
@@ -318,16 +320,6 @@ class CarlaEnv(gym.Env):
                 dtype=np.float32,
             )
         else:
-            # self._action_space = gym.spaces.Dict(
-            #     {
-            #         ego_id: gym.spaces.Box(
-            #             low=np.array([0.0, -1.0, 0.0], dtype=np.float32),
-            #             high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
-            #             dtype=np.float32,
-            #         )
-            #         for ego_id in self._obs_configs.keys()
-            #     }
-            # )
             self._action_space = gym.spaces.Box(
                 low=np.array([0.0, -1.0, 0.0], dtype=np.float32),
                 high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
@@ -399,36 +391,13 @@ class CarlaEnv(gym.Env):
 
         self._wt_handler.reset(self._task["weather"])
         ev_spawn_locations = self._ev_handler.reset(self._task["ego_vehicles"])
-        self._sa_handler.reset(self._task["scenario_actors"], self._ev_handler.ego_vehicles)
+        self._sa_handler.reset(self._task)
         self._zw_handler.reset(self._task["num_npc_walkers"], ev_spawn_locations)
         self._zv_handler.reset(self._task["num_npc_vehicles"], ev_spawn_locations)
         self._om_handler.reset(self._ev_handler.ego_vehicles)
 
     def _update_timestamp(self, *, reset_called: bool = False) -> None:
-        """Update both world-local and env-global timers.
-
-        This method **must** be invoked exactly once per CARLA tick.
-        It fuses two internal timing scopes into a public ``self._timestamp`` dict.
-
-        * World-local timer — Resets whenever the CARLA server restarts.
-            Keys produced: ``step``, ``frame``, ``wall_time``,
-            ``relative_wall_time``, ``simulation_time``,
-            ``relative_simulation_time``, ``delta_seconds``.
-        * Env-global timer — Lives for the entire lifetime of the :class:`CarlaEnv` instance.
-            Keys produced: ``global_step``, ``global_relative_wall_time``.
-
-        Args:
-            reset_called (bool, optional):
-                Set to ``True`` when the call directly follows
-                :py:meth:`reset`. In that case the **per-episode**
-                ``step`` counter is re-zeroed, while all global counters
-                keep increasing.
-
-        Notes:
-            * Internal helpers ``_world_time``, ``_env_time`` and
-            ``_prev_sim_time`` are implementation details.
-            * The caller is responsible for avoiding concurrent invocations.
-        """
+        """Update timestamp and world time."""
         snap = self._runtime.world.get_snapshot()
 
         # ---------- World-local timer (resets on server restart) ----------
