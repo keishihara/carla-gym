@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Iterator, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,11 @@ import carla
 import numpy as np
 from srunner.scenarioconfigs.scenario_configuration import ScenarioConfiguration
 from srunner.tools.route_parser import RouteParser
+
+from carla_gym.utils.logger import setup_logger
+
+logger = setup_logger(__name__)
+
 
 __all__ = [
     "EgoVehiclesConfig",
@@ -57,6 +62,7 @@ MAP_NAMES_FULL = [
     "Town13",
     "Town15",
 ]
+
 MAX_NUM_NPC_VEHICLES = {
     "Town01": 120,
     "Town02": 70,
@@ -83,6 +89,38 @@ MAX_NUM_NPC_WALKERS = {
     "Town13": 10,
     "Town15": 70,
 }
+
+WEATHERS = [
+    "ClearNoon",
+    "CloudyNoon",
+    "WetNoon",
+    "WetCloudyNoon",
+    "SoftRainNoon",
+    "MidRainyNoon",
+    "HardRainNoon",
+    "ClearSunset",
+    "CloudySunset",
+    "WetSunset",
+    "WetCloudySunset",
+    "SoftRainSunset",
+    "MidRainSunset",
+    "HardRainSunset",
+]
+
+
+def get_weathers(weather_group: str) -> list[str]:
+    if "dynamic" in weather_group:
+        # For dynamic weather, create single task
+        weathers = [weather_group]
+    elif weather_group == "new":
+        weathers = ["SoftRainSunset", "WetSunset"]
+    elif weather_group == "train":
+        weathers = ["ClearNoon", "WetNoon", "HardRainNoon", "ClearSunset"]
+    elif weather_group == "all":
+        weathers = WEATHERS
+    else:
+        raise ValueError(f"Invalid weather group: {weather_group}")
+    return weathers
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +255,10 @@ class TaskConfig:
     route_file: str | None = None
     route_id: str | None = None
     scenarios: list[ScenarioConfig] = field(default_factory=list)
-    keypoints: list[carla.Location] = field(default_factory=list)
+    # Route waypoints kept as plain floats for pickling safety. Each entry is
+    # (x, y, z).  They are converted to ``carla.Transform`` objects by
+    # :py:meth:`resolve_routes` immediately before the episode starts.
+    keypoints: list[tuple[float, float, float]] = field(default_factory=list)
     seed: int | None = None
 
     # ------------------------------------------------------------------
@@ -228,6 +269,55 @@ class TaskConfig:
         # Normalise NPC ranges to tuple[int, int]
         self.num_npc_vehicles = _normalise_range(self.num_npc_vehicles)
         self.num_npc_walkers = _normalise_range(self.num_npc_walkers)
+
+        self._load_route_file_if_available()
+
+    def _load_route_file_if_available(self) -> None:
+        if not self.route_file:
+            return
+
+        route_confs = RouteParser.parse_routes_file(self.route_file)
+
+        if self.route_id is None:
+            logger.warning("route_id is not set, using the first route id")
+            self.route_id = route_confs[0].name.replace("RouteScenario_", "")
+
+        route_conf = next((rc for rc in route_confs if rc.name == f"RouteScenario_{self.route_id}"), None)
+        if route_conf is None:
+            raise ValueError(f"Route {self.route_id} not found in {self.route_file}")
+
+        self.scenarios = [ScenarioConfig.from_srunner(sc) for sc in route_conf.scenario_configs]
+
+        # Store raw floats only (conversion deferred)
+        self.keypoints = [(p.x, p.y, p.z) for p in route_conf.keypoints]
+        # Routes will be filled later by resolve_routes()
+        self.ego_vehicles = EgoVehiclesConfig()
+
+    @classmethod
+    def from_route_file(cls, route_file: str, route_id: str) -> TaskConfig:
+        """Create TaskConfig from route file and route id."""
+        route_confs = RouteParser.parse_routes_file(route_file)
+        route_conf = next((rc for rc in route_confs if rc.name == f"RouteScenario_{route_id}"), None)
+        if route_conf is None:
+            raise ValueError(f"Route {route_id} not found in {route_file}")
+
+        scenarios = [ScenarioConfig.from_xml(sc) for sc in route_conf.scenario_configs]
+
+        # Defer Transform creation – keep floats only
+        float_pts = [(p.x, p.y, p.z) for p in route_conf.keypoints]
+        ego_conf = EgoVehiclesConfig()
+
+        return cls(
+            weather=route_conf.weather,
+            map_name=route_conf.town,
+            num_npc_vehicles=0,
+            num_npc_walkers=0,
+            ego_vehicles=ego_conf,
+            route_file=route_file,
+            route_id=route_id,
+            scenarios=scenarios,
+            keypoints=float_pts,
+        )
 
     # ------------------------------------------------------------------
     #  Behaviour helpers
@@ -278,7 +368,20 @@ class TaskConfig:
     # ------------------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        """Return a pickle-safe plain dict (no CARLA objects)."""
+
+        return {
+            "weather": self.weather,
+            "map_name": self.map_name,
+            "num_npc_vehicles": self.num_npc_vehicles,
+            "num_npc_walkers": self.num_npc_walkers,
+            "ego_vehicles": self.ego_vehicles.to_dict(),
+            "route_file": self.route_file,
+            "route_id": self.route_id,
+            "scenarios": [sc.to_dict() for sc in self.scenarios],
+            "keypoints": self.keypoints,
+            "seed": self.seed,
+        }
 
     # Provide mapping-like convenience
     def copy(self) -> TaskConfig:
@@ -287,6 +390,28 @@ class TaskConfig:
         import copy
 
         return copy.deepcopy(self)
+
+    # ------------------------------------------------------------------
+    #  Runtime helpers
+    # ------------------------------------------------------------------
+
+    def resolve_routes(self, map: carla.Map) -> None:
+        """Populate ``ego_vehicles.routes`` with ``carla.Transform`` objects.
+
+        This method is idempotent; calling it multiple times has no effect
+        after the first successful conversion.  The yaw component is set to 0
+        degrees because the XML route file stores only (x,y,z).
+        """
+
+        if self.ego_vehicles.routes.get("hero"):
+            return  # already resolved
+
+        if not self.keypoints:
+            logger.warning("keypoints is empty; cannot resolve hero route")
+            return
+
+        transforms = [map.get_waypoint(carla.Location(x=x, y=y, z=z)).transform for x, y, z in self.keypoints]
+        self.ego_vehicles.routes["hero"] = transforms
 
 
 # ---------------------------------------------------------------------------
@@ -415,15 +540,21 @@ class TaskSet(Sequence[TaskConfig]):
 
         for rc in route_confs:
             scenarios = [ScenarioConfig.from_srunner(sc) for sc in rc.scenario_configs]
+
+            # Store raw floats only (conversion deferred)
+            float_pts = [(p.x, p.y, p.z) for p in rc.keypoints]
+            ego_conf = EgoVehiclesConfig()
+
             task = TaskConfig(
                 weather=weather,
                 map_name=rc.town,
                 num_npc_vehicles=num_npc_vehicles,
                 num_npc_walkers=num_npc_walkers,
+                ego_vehicles=ego_conf,
                 route_file=str(path),
                 route_id=rc.name.replace("RouteScenario_", ""),
                 scenarios=scenarios,
-                keypoints=rc.keypoints,
+                keypoints=float_pts,
             )
             task_list.append(task)
 

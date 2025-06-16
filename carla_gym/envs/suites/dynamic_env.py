@@ -74,7 +74,7 @@ class DynamicEnv(CarlaEnv):
         return {
             "hero": {
                 "birdview": {
-                    "module": "birdview.chauffeurnet",
+                    "module": "birdview.chauffeurnet:Birdview",
                     "width_in_pixels": 256,
                     "pixels_ev_to_bottom": 64,
                     "pixels_per_meter": 4.0,
@@ -83,13 +83,27 @@ class DynamicEnv(CarlaEnv):
                     "scale_mask_col": 1.1,
                 },
                 "speed": {
-                    "module": "actor_state.speed",
+                    "module": "actor_state.speed:ObsManager",
                 },
                 "control": {
-                    "module": "actor_state.control",
+                    "module": "actor_state.control:ObsManager",
                 },
                 "velocity": {
-                    "module": "actor_state.velocity",
+                    "module": "actor_state.velocity:ObsManager",
+                },
+                "front_rgb": {
+                    "module": "camera.rgb:CameraRGB",
+                    "type": "sensor.camera.rgb",
+                    "x": -1.5,
+                    "y": 0.0,
+                    "z": 2.0,
+                    "roll": 0.0,
+                    "pitch": 0.0,
+                    "yaw": 0.0,
+                    "width": 512,
+                    "height": 256,
+                    "fov": 110,
+                    "id": "front_rgb",
                 },
             }
         }

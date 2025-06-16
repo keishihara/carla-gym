@@ -149,6 +149,12 @@ class CarlaEnv(gym.Env):
         if "nullrhi" in options:
             self._runtime.set_nullrhi(options["nullrhi"])
 
+        # Task shuffle
+        if options.get("resample_task", False):
+            logger.info("Resampling task")
+            self._task_config = TaskConfig.sample(n=1)
+            self._task = self._task_config.to_dict()
+
         # Maintain server / client
         server_restarted = self._runtime.ensure_healthy()
         if server_restarted:
@@ -160,11 +166,6 @@ class CarlaEnv(gym.Env):
         else:
             self._clean()
             self._init_handlers()
-
-        # Task shuffle
-        if self._endless_task:
-            self._task_config = TaskConfig.sample(n=1)
-            self._task = self._task_config.to_dict()
 
         # Handlers
         self._reset_handlers()
@@ -200,7 +201,7 @@ class CarlaEnv(gym.Env):
         # Apply control
         control_dict = self._process_action(control)
         self._ev_handler.apply_control(control_dict)
-        self._sa_handler.tick(self.timestamp)
+        self._sa_handler.tick(self.timestamp["carla_timestamp"])
 
         # Simulator tick
         self._runtime.world.tick()
@@ -303,7 +304,6 @@ class CarlaEnv(gym.Env):
         self._rng = np.random.default_rng(self._seed)
 
         # First task
-        self._endless_task = True
         self._task = self._task_config.to_dict()
 
         # Handlers
@@ -389,9 +389,14 @@ class CarlaEnv(gym.Env):
 
         TrafficLightHandler.reset(self._runtime.world)
 
+        # Ensure hero route is converted to carla.Transform before spawning ego
+        self._task_config.resolve_routes(self._runtime.world.get_map())
+        # Reflect the resolved route into the plain-dict copy
+        self._task["ego_vehicles"]["routes"]["hero"] = self._task_config.ego_vehicles.routes["hero"]
+
         self._wt_handler.reset(self._task["weather"])
         ev_spawn_locations = self._ev_handler.reset(self._task["ego_vehicles"])
-        self._sa_handler.reset(self._task)
+        self._sa_handler.reset(self._task_config)
         self._zw_handler.reset(self._task["num_npc_walkers"], ev_spawn_locations)
         self._zv_handler.reset(self._task["num_npc_vehicles"], ev_spawn_locations)
         self._om_handler.reset(self._ev_handler.ego_vehicles)
@@ -449,6 +454,7 @@ class CarlaEnv(gym.Env):
             # carla_gym compatibility
             "start_frame": self._world_time["start_frame"],
             "start_simulation_time": self._world_time["start_sim_time"],
+            "carla_timestamp": snap.timestamp,
         }
 
     def _get_observation(self) -> dict:
