@@ -10,10 +10,10 @@ from gymnasium import spaces
 import carla_gym.utils.transforms as trans_utils
 from carla_gym.engine.navigation.map_utils import RoadOption
 from carla_gym.engine.navigation.route_manipulation import gps_util
-from carla_gym.engine.observation.obs_manager import ObsManagerBase
+from carla_gym.engine.observation.base import BaseObservation
 
 
-class ObsManager(ObsManagerBase):
+class ObsManager(BaseObservation):
     def __init__(self, obs_configs):
         self._gnss_sensor = None
         self._imu_sensor = None

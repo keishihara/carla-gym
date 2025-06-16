@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import numpy as np
 
+from carla_gym.utils.logger import setup_logger
+
+logger = setup_logger(__name__)
+
 
 class ValeoNoDetPx:
     """
@@ -44,6 +48,23 @@ class ValeoNoDetPx:
             thresh_lat_dist = max(self._min_thresh_lat_dist, self._last_lat_dist)
         c_lat_dist = lat_dist > thresh_lat_dist + 1e-2
         self._last_lat_dist = lat_dist
+
+        # # logger.warning("We have modified the lat_dist threshold to 5.0 and added off-road check")
+        # # FIXME: これをやってしまうとおそらく赤信号で対向車線に飛び出して走り抜けてしまう
+        # # そのため、construction site のようなシナリオに近いところでこのチェックを行うようにする
+        # if lat_dist - self._last_lat_dist > 0.8:
+        #     thresh_lat_dist = lat_dist + 0.5
+        # else:
+        #     thresh_lat_dist = max(self._min_thresh_lat_dist, self._last_lat_dist)
+        # c_lat_dist = lat_dist > thresh_lat_dist + 5.0
+        # self._last_lat_dist = lat_dist
+        # on_road_wp = self._ego_vehicle._map.get_waypoint(
+        #     ev_loc,
+        #     project_to_road=False,
+        #     lane_type=carla.LaneType.Driving | carla.LaneType.Parking,
+        # )
+        # c_off_road = on_road_wp is None
+        # c_lat_dist = c_lat_dist or c_off_road
 
         # Done condition 3: running red light
         c_run_rl = self._ego_vehicle.info_criteria["run_red_light"] is not None

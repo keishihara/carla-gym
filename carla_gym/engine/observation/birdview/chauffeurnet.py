@@ -12,7 +12,7 @@ from gymnasium import spaces
 
 from carla_gym import CARLA_GYM_ROOT_DIR
 from carla_gym.engine.actors.ego.vehicle import EgoVehicle
-from carla_gym.engine.observation.obs_manager import ObsManagerBase
+from carla_gym.engine.observation.base import BaseObservation
 from carla_gym.utils.traffic_light import TrafficLightHandler
 
 MAP_DIR = CARLA_GYM_ROOT_DIR / "assets" / "maps"
@@ -31,6 +31,7 @@ COLOR_GREY = (128, 128, 128)
 COLOR_ALUMINIUM_0 = (238, 238, 236)
 COLOR_ALUMINIUM_3 = (136, 138, 133)
 COLOR_ALUMINIUM_5 = (46, 52, 54)
+COLOR_PINK = (255, 0, 160)  # #FF00A0
 
 
 def tint(color, factor):
@@ -54,7 +55,7 @@ def tint(color, factor):
     return (r, g, b)
 
 
-class ObsManager(ObsManagerBase):
+class Birdview(BaseObservation):
     def __init__(self, obs_configs):
         self._width = int(obs_configs["width_in_pixels"])
         self._pixels_ev_to_bottom = obs_configs["pixels_ev_to_bottom"]
@@ -67,7 +68,7 @@ class ObsManager(ObsManagerBase):
         self._history_queue = deque(maxlen=maxlen_queue)
 
         self._image_channels = 3
-        self._masks_channels = 3 + 3 * len(self._history_idx)
+        self._masks_channels = 4 + 3 * len(self._history_idx)
         self._vehicle = None
         self._world = None
         self._map_dir = MAP_DIR / f"maps_{self._pixels_per_meter}ppm"
@@ -141,13 +142,40 @@ class ObsManager(ObsManagerBase):
             return c_distance and (not c_ev)
 
         vehicle_bbox_list = self._world.get_level_bbs(carla.CityObjectLabel.Car)
+        motorcycle_bbox_list = self._world.get_level_bbs(carla.CityObjectLabel.Motorcycle)
+        bicycle_bbox_list = self._world.get_level_bbs(carla.CityObjectLabel.Bicycle)
+        vehicle_bbox_list = vehicle_bbox_list + motorcycle_bbox_list + bicycle_bbox_list
+
         walker_bbox_list = self._world.get_level_bbs(carla.CityObjectLabel.Pedestrians)
+
+        static_all = list(self._world.get_actors().filter("*static*"))
+        # for static in static_all:
+        #     if static.type_id == "static.prop.mesh":
+        #         if "mesh_path" in static.attributes:
+        #             if "Car" in static.attributes["mesh_path"]:
+        #                 vehicles.append(static)
+        static_actors = [e for e in static_all if e.type_id != "static.prop.mesh"]
+
+        static_bbox_list = []
+        for static in static_actors:
+            static_transform = static.get_transform()
+            transform = carla.Transform(static_transform.location)
+            bounding_box = carla.BoundingBox(transform.location, static.bounding_box.extent)
+            bounding_box.rotation = carla.Rotation(
+                pitch=static.bounding_box.rotation.pitch + static_transform.rotation.pitch,
+                yaw=static.bounding_box.rotation.yaw + static_transform.rotation.yaw,
+                roll=static.bounding_box.rotation.roll + static_transform.rotation.roll,
+            )
+            static_bbox_list.append(bounding_box)
+
         if self._scale_bbox:
             vehicles = self._get_surrounding_actors(vehicle_bbox_list, is_within_distance, 1.0)
             walkers = self._get_surrounding_actors(walker_bbox_list, is_within_distance, 2.0)
+            statics = self._get_surrounding_actors(static_bbox_list, is_within_distance, 1.0)
         else:
             vehicles = self._get_surrounding_actors(vehicle_bbox_list, is_within_distance)
             walkers = self._get_surrounding_actors(walker_bbox_list, is_within_distance)
+            statics = self._get_surrounding_actors(static_bbox_list, is_within_distance)
 
         tl_green = TrafficLightHandler.get_stopline_vtx(ev_loc, 0)
         tl_yellow = TrafficLightHandler.get_stopline_vtx(ev_loc, 1)
@@ -157,6 +185,8 @@ class ObsManager(ObsManagerBase):
         self._history_queue.append((vehicles, walkers, tl_green, tl_yellow, tl_red, stops))
 
         M_warp = self._get_warp_transform(ev_loc, ev_rot)
+
+        obstacle_mask = self._get_mask_from_actor_list(statics, M_warp)
 
         # objects with history
         vehicle_masks, walker_masks, tl_green_masks, tl_yellow_masks, tl_red_masks, stop_masks = (
@@ -206,13 +236,14 @@ class ObsManager(ObsManagerBase):
             image[mask] = tint(COLOR_CYAN, (h_len - i) * 0.2)
 
         image[ev_mask] = COLOR_WHITE
-        # image[obstacle_mask] = COLOR_BLUE
+        image[obstacle_mask] = COLOR_PINK
 
         # masks
         c_road = road_mask * 255
         c_route = route_mask * 255
         c_lane = lane_mask_all * 255
         c_lane[lane_mask_broken] = 120
+        c_static = obstacle_mask * 255
 
         # masks with history
         c_tl_history = []
@@ -227,12 +258,23 @@ class ObsManager(ObsManagerBase):
         c_vehicle_history = [m * 255 for m in vehicle_masks]
         c_walker_history = [m * 255 for m in walker_masks]
 
-        masks = np.stack((c_road, c_route, c_lane, *c_vehicle_history, *c_walker_history, *c_tl_history), axis=2)
+        masks = np.stack(
+            (
+                c_road,
+                c_route,
+                c_lane,
+                c_static,
+                *c_vehicle_history,
+                *c_walker_history,
+                *c_tl_history,
+            ),
+            axis=2,
+        )
         masks = np.transpose(masks, [2, 0, 1])
 
         obs_dict = {"rendered": image, "masks": masks}
 
-        self._parent_actor.vehicle.collision_px = np.any(ev_mask_col & walker_masks[-1])
+        self._parent_actor.vehicle.collision_px = np.any(ev_mask_col & (walker_masks[-1] | obstacle_mask))
 
         time_end = time.perf_counter()
         # print(f"Time taken: {time_end - time_start} seconds")  # mean 0.03 seconds
@@ -412,9 +454,15 @@ def warp_affine(
         wc = (x1 - src_x) * (src_y - y0)
         wd = (src_x - x0) * (src_y - y0)
 
-        def sample(ix: np.ndarray, iy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        def sample_old(ix: np.ndarray, iy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             mask = (0 <= ix) & (ix < src.shape[1]) & (0 <= iy) & (iy < src.shape[0])
             return mask, src[iy.clip(0), ix.clip(0)]
+
+        def sample(ix: np.ndarray, iy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            mask = (0 <= ix) & (ix < src.shape[1]) & (0 <= iy) & (iy < src.shape[0])
+            ix_safe = np.clip(ix, 0, src.shape[1] - 1)
+            iy_safe = np.clip(iy, 0, src.shape[0] - 1)
+            return mask, src[iy_safe, ix_safe]
 
         if src.ndim == 2:
             out = np.full((height * width,), border_value, dtype=float)

@@ -5,10 +5,10 @@ import numpy as np
 from gymnasium import spaces
 
 import carla_gym.utils.transforms as trans_utils
-from carla_gym.engine.observation.obs_manager import ObsManagerBase
+from carla_gym.engine.observation.base import BaseObservation
 
 
-class ObsManager(ObsManagerBase):
+class ObsManager(BaseObservation):
     """
     Template config
     obs_configs = {

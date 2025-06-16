@@ -6,10 +6,10 @@ import carla
 import numpy as np
 from gymnasium import spaces
 
-from carla_gym.engine.observation.obs_manager import ObsManagerBase
+from carla_gym.engine.observation.base import BaseObservation
 
 
-class ObsManager(ObsManagerBase):
+class CameraRGB(BaseObservation):
     """
     Template configs:
     obs_configs = {
@@ -24,22 +24,22 @@ class ObsManager(ObsManagerBase):
     """
 
     def __init__(self, obs_configs):
-        self._sensor_type = "camera.rgb"
+        self._sensor_type = "sensor.camera.rgb"
 
         self._height = obs_configs["height"]
         self._width = obs_configs["width"]
         self._fov = obs_configs["fov"]
-        self._channels = 4
+        self._channels = 3
 
         location = carla.Location(
-            x=float(obs_configs["location"][0]),
-            y=float(obs_configs["location"][1]),
-            z=float(obs_configs["location"][2]),
+            x=float(obs_configs["x"]),
+            y=float(obs_configs["y"]),
+            z=float(obs_configs["z"]),
         )
         rotation = carla.Rotation(
-            roll=float(obs_configs["rotation"][0]),
-            pitch=float(obs_configs["rotation"][1]),
-            yaw=float(obs_configs["rotation"][2]),
+            roll=float(obs_configs["roll"]),
+            pitch=float(obs_configs["pitch"]),
+            yaw=float(obs_configs["yaw"]),
         )
 
         self._camera_transform = carla.Transform(location, rotation)
@@ -64,21 +64,16 @@ class ObsManager(ObsManagerBase):
 
         self._world = parent_actor.vehicle.get_world()
 
-        bp = self._world.get_blueprint_library().find("sensor." + self._sensor_type)
+        bp = self._world.get_blueprint_library().find(self._sensor_type)
         bp.set_attribute("image_size_x", str(self._width))
         bp.set_attribute("image_size_y", str(self._height))
         bp.set_attribute("fov", str(self._fov))
-        # set in leaderboard
-        bp.set_attribute("lens_circle_multiplier", str(3.0))
-        bp.set_attribute("lens_circle_falloff", str(3.0))
-        bp.set_attribute("chromatic_aberration_intensity", str(0.5))
-        bp.set_attribute("chromatic_aberration_offset", str(0))
 
         self._sensor = self._world.spawn_actor(bp, self._camera_transform, attach_to=parent_actor.vehicle)
         weak_self = weakref.ref(self)
         self._sensor.listen(lambda image: self._parse_image(weak_self, image))
 
-    def get_observation(self):
+    def get_observation_old(self):
         snap_shot = self._world.get_snapshot()
         assert self._image_queue.qsize() <= 1
 
@@ -88,9 +83,38 @@ class ObsManager(ObsManagerBase):
         except Empty:
             raise Exception("RGB sensor took too long!") from None
 
-        obs = {"frame": frame, "data": data}
+        return {"frame": frame, "data": data}
 
-        return obs
+    def get_observation(self):
+        """
+        Return the RGB image strictly matching the expected frame (if one was set by ObsManagerHandler).
+        Older frames are discarded; newer frames are waited for.
+        """
+        expected = getattr(self, "_expected_frame", None)
+        if expected is None:
+            expected = self._world.get_snapshot().frame
+
+        assert self._image_queue.qsize() <= 1
+
+        while True:
+            # if sensor has pushed more than one frame, drop the oldest one
+            while self._image_queue.qsize() > 1:
+                _ = self._image_queue.get_nowait()
+
+            try:
+                frame, data = self._image_queue.get(True, self._queue_timeout)
+            except Empty:
+                raise RuntimeError("RGB sensor took too long!") from None
+
+            if frame < expected:
+                # older frame, drop it and wait for the next frame
+                continue
+
+            if frame > expected:
+                # it is likely that we missed the expected frame. wait for the next frame
+                continue
+
+            return {"frame": frame, "data": data}
 
     def clean(self):
         if self._sensor and self._sensor.is_alive:
@@ -98,7 +122,6 @@ class ObsManager(ObsManagerBase):
             self._sensor.destroy()
         self._sensor = None
         self._world = None
-
         self._image_queue = None
 
     @staticmethod
@@ -106,16 +129,8 @@ class ObsManager(ObsManagerBase):
         self = weak_self()
 
         np_img = np.frombuffer(carla_image.raw_data, dtype=np.dtype("uint8"))
-
         np_img = copy.deepcopy(np_img)
-
         np_img = np.reshape(np_img, (carla_image.height, carla_image.width, 4))
         np_img = np_img[:, :, :3]
         np_img = np_img[:, :, ::-1]
-
-        # np_img = np.moveaxis(np_img, -1, 0)
-        # image = cv2.resize(image, (self._res_x, self._res_y), interpolation=cv2.INTER_AREA)
-        # image = np.float32
-        # image = (image.astype(np.float32) - 128) / 128
-
         self._image_queue.put((carla_image.frame, np_img))

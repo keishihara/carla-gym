@@ -1,10 +1,10 @@
 import numpy as np
 from gymnasium import spaces
 
-from carla_gym.engine.observation.obs_manager import ObsManagerBase
+from carla_gym.engine.observation.base import BaseObservation
 
 
-class ObsManager(ObsManagerBase):
+class ObsManager(BaseObservation):
     def __init__(self, obs_configs):
         self._parent_actor = None
         super().__init__()
