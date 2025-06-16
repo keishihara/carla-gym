@@ -159,8 +159,19 @@ class CarlaClientManager:
         settings.synchronous_mode = sync
         settings.fixed_delta_seconds = 0.05
         settings.deterministic_ragdolls = True
+
+        # Physics substepping
+        settings.substepping = True
+        settings.max_substep_delta_time = 0.0125  # 1 サブステップ ≦ 0.0125 s
+        settings.max_substeps = 4  # 0.0125 s × 4 = 0.05 s
+
+        # タイル／アクター負荷軽減
+        settings.tile_stream_distance = 600.0  # 600 m 以内だけロード
+        settings.actor_active_distance = 300.0  # 300 m 以内だけ物理計算
+
         self.world.apply_settings(settings)
         self.tm.set_synchronous_mode(sync)
+        self.tm.set_hybrid_physics_mode(sync)
         if self._seed is not None:
             self.tm.set_random_device_seed(self._seed)
 

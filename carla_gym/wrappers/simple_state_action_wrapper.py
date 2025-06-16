@@ -106,12 +106,15 @@ class SimpleStateActionWrapper(gym.Wrapper):
         self.eval_mode: bool = False
 
         low, high = self._state_bounds()
-        self.observation_space = gym.spaces.Dict(
-            {
-                "state": gym.spaces.Box(low, high, dtype=np.float32),
-                "birdview": self.observation_space["birdview"]["masks"],
-            }
-        )
+
+        observation_space = {}
+        observation_space["state"] = gym.spaces.Box(low, high, dtype=np.float32)
+        if "birdview" in self.observation_space.keys():
+            observation_space["birdview"] = self.observation_space["birdview"]["masks"]
+        if "front_rgb" in self.observation_space.keys():
+            observation_space["front_rgb"] = self.observation_space["front_rgb"]["data"]
+        self.observation_space = gym.spaces.Dict(observation_space)
+
         if self.acc_as_action:
             self.action_space = gym.spaces.Box(
                 low=np.array([-1.0, -1.0], dtype=np.float32),
@@ -197,12 +200,19 @@ class SimpleStateActionWrapper(gym.Wrapper):
         return low, high
 
     def _proc_obs(self, obs: dict, *, train: bool) -> dict:
-        vec = np.concatenate([_OBS_EXTRACTORS[k](obs).flatten() for k in self.input_states]).astype(np.float32)
-        bev = obs["birdview"]["masks"]
-        if not train:
-            vec = vec[None]
-            bev = bev[None]
-        return {"state": vec, "birdview": bev}
+        processed_obs = {}
+        obs_keys = list(self.observation_space.keys())
+        if "state" in obs_keys:
+            vec = np.concatenate(
+                [_OBS_EXTRACTORS[k](obs).flatten() for k in self.input_states if k != "birdview" and k != "front_rgb"]
+            ).astype(np.float32)
+            processed_obs["state"] = vec
+        if "birdview" in obs_keys:
+            bev = obs["birdview"]["masks"]
+            processed_obs["birdview"] = bev
+        if "front_rgb" in obs_keys:
+            processed_obs["front_rgb"] = obs["front_rgb"]["data"]
+        return processed_obs
 
     def _proc_act(self, act, *, train: bool):
         if not train:
@@ -221,13 +231,13 @@ class SimpleStateActionWrapper(gym.Wrapper):
         )
 
     def _setup_eval_population(self):
-        task = self.env.unwrapped._task  # pylint: disable=protected-access
+        task = self.env.unwrapped._task
         handler = self.env.unwrapped._ev_handler
         if self.eval_mode:
             m = self.env.unwrapped.carla_map
             task["num_npc_vehicles"] = DEFAULT_NUM_NPC_VEHICLES[m]
             task["num_npc_walkers"] = DEFAULT_NUM_NPC_WALKERS[m]
-        for ev_id in handler._terminal_configs:  # pylint: disable=protected-access
+        for ev_id in handler._terminal_configs:
             handler._terminal_configs[ev_id]["kwargs"]["eval_mode"] = self.eval_mode
 
     # ------------------------------------------------------------------

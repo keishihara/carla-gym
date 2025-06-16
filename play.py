@@ -18,24 +18,26 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
-    env = None  # Initialize env variable
-    try:
-        terminal_configs = {
-            "hero": {
-                "entry_point": "terminal.valeo_no_det_px:ValeoNoDetPx",
-                "kwargs": {
-                    "timeout_steps": 50,
-                },
-            }
+    terminal_configs = {
+        "hero": {
+            "entry_point": "terminal.valeo_no_det_px:ValeoNoDetPx",
+            "kwargs": {
+                "timeout_steps": 3000,
+            },
         }
+    }
+    task_config = TaskConfig(
+        map_name=args.map,
+        weather="ClearNoon",
+        num_npc_vehicles=0,
+        num_npc_walkers=0,
+        seed=args.seed,
+        route_file="/home/keishi_ishihara/workspace/carla-gym/packages/carla_garage/leaderboard/data/bench2drive220_1833.xml",
+        route_id="1833",
+    )
 
-        task_config = TaskConfig(
-            map_name=args.map,
-            weather="dynamic_1.0",
-            num_npc_vehicles=(10, 20),
-            num_npc_walkers=(10, 20),
-            seed=args.seed,
-        )
+    env = None
+    try:
         env = gym.make(
             "carla_gym:DynamicEnv-v1",
             gpu_id=args.gpu_id,
@@ -45,7 +47,6 @@ def main():
             render_mode="rgb_array",
         )
         env = SimpleStateActionWrapper(env)
-
         env.reset()
 
         step = 0
@@ -53,6 +54,7 @@ def main():
         while True:
             action = env.action_space.sample()
             action[0] = abs(action[0])  # no brake to avoid stationary
+            # action[1] = 0.0  # go straight
 
             obs, reward, terminated, truncated, info = env.step(action)
 
@@ -62,9 +64,11 @@ def main():
                 f"Step {step}: reward: {reward:.4f}, terminated: {terminated}, truncated: {truncated}, fps: {steps_per_second:.2f}"
             )
 
-            if step % 1 == 0:
+            if step % 5 == 0:
                 rendered = env.render()
                 Image.fromarray(rendered).save("rendered.png")
+                if "front_rgb" in obs:
+                    Image.fromarray(obs["front_rgb"]).save("front_rgb.png")
 
             if terminated or truncated:
                 break
