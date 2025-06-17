@@ -23,6 +23,7 @@ from srunner.scenariomanager.scenario_manager import ScenarioManager
 from srunner.scenariomanager.timer import GameTime
 from srunner.scenariomanager.watchdog import Watchdog
 
+from carla_gym import CARLA_GYM_ROOT_DIR
 from carla_gym.envs.task_config import TaskConfig
 
 
@@ -66,7 +67,7 @@ class ScenarioActorHandler:
         self._last_build_time = float("-inf")
 
         os.environ["SCENARIO_RUNNER_ROOT"] = (
-            "/home/keishi_ishihara/workspace/carla-gym/packages/carla_garage/scenario_runner_autopilot"
+            f"{CARLA_GYM_ROOT_DIR.as_posix()}/packages/carla_garage/scenario_runner_autopilot"
         )
 
     # ------------------------------------------------------------------ #
