@@ -363,6 +363,133 @@ class TaskConfig:
             return _sample_one()
         return [_sample_one(i) for i in range(n)]
 
+    @classmethod
+    def from_leaderboard_2_0(
+        cls,
+        scenario_type: str | None = None,
+        town: str | None = None,
+        leaderboard_data_path: str | None = None,
+        num_npc_vehicles: int | tuple[int, int] = 0,
+        num_npc_walkers: int | tuple[int, int] = 0,
+        weather: str = "ClearNoon",
+        seed: int | None = None,
+    ) -> TaskConfig | None:
+        """Create TaskConfig from Leaderboard 2.0 scenario data.
+
+        Args:
+            scenario_type: Type of scenario (e.g., 'Accident', 'BlockedIntersection')
+            town: CARLA town name (e.g., 'Town13')
+            leaderboard_data_path: Path to leaderboard_2_0/data directory
+            num_npc_vehicles: Number of NPC vehicles
+            num_npc_walkers: Number of NPC walkers
+            weather: Weather condition
+            seed: Random seed for route selection
+
+        Returns:
+            TaskConfig instance or None if no routes found
+        """
+        try:
+            # Import here to avoid circular imports
+            from carla_gym.envs.leaderboard_scenario_loader import create_leaderboard_loader
+
+            loader = create_leaderboard_loader(leaderboard_data_path)
+
+            if seed is not None:
+                import random
+
+                random.seed(seed)
+
+            # Get random route matching criteria
+            route = loader.get_random_route(scenario_type, town)
+            if not route:
+                logger.warning(f"No routes found for scenario_type={scenario_type}, town={town}")
+                return None
+
+            return loader.create_task_config(
+                route=route, num_npc_vehicles=num_npc_vehicles, num_npc_walkers=num_npc_walkers, weather=weather
+            )
+
+        except ImportError as e:
+            logger.error(f"Failed to import leaderboard_scenario_loader: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to create TaskConfig from leaderboard_2_0: {e}")
+            return None
+
+    @classmethod
+    def sample_leaderboard_scenarios(
+        cls,
+        n: int = 1,
+        scenario_types: list[str] | None = None,
+        towns: list[str] | None = None,
+        leaderboard_data_path: str | None = None,
+        num_npc_vehicles: int | tuple[int, int] = (0, 10),
+        num_npc_walkers: int | tuple[int, int] = (0, 5),
+        weathers: list[str] | None = None,
+        seed: int | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> list[TaskConfig]:
+        """Sample multiple TaskConfigs from Leaderboard 2.0 scenarios.
+
+        Args:
+            n: Number of TaskConfigs to generate
+            scenario_types: List of scenario types to sample from
+            towns: List of towns to sample from
+            leaderboard_data_path: Path to leaderboard_2_0/data directory
+            num_npc_vehicles: Number/range of NPC vehicles
+            num_npc_walkers: Number/range of NPC walkers
+            weathers: List of weather conditions
+            seed: Random seed
+            rng: Random number generator
+
+        Returns:
+            List of TaskConfig instances
+        """
+        try:
+            from carla_gym.envs.leaderboard_scenario_loader import create_leaderboard_loader
+
+            loader = create_leaderboard_loader(leaderboard_data_path)
+            rng = rng or np.random.default_rng(seed=seed)
+
+            # Get available options if not specified
+            if scenario_types is None:
+                scenario_types = loader.get_available_scenario_types()
+            if towns is None:
+                towns = loader.get_available_towns()
+            if weathers is None:
+                weathers = ["ClearNoon", "CloudyNoon", "WetNoon", "ClearSunset"]
+
+            tasks = []
+            for i in range(n):
+                # Sample parameters
+                scenario_type = rng.choice(scenario_types) if scenario_types else None
+                town = rng.choice(towns) if towns else None
+                weather = rng.choice(weathers)
+                npc_veh = _sample_range(num_npc_vehicles, rng)
+                npc_wlk = _sample_range(num_npc_walkers, rng)
+
+                # Create task config
+                task_config = cls.from_leaderboard_2_0(
+                    scenario_type=scenario_type,
+                    town=town,
+                    leaderboard_data_path=leaderboard_data_path,
+                    num_npc_vehicles=npc_veh,
+                    num_npc_walkers=npc_wlk,
+                    weather=weather,
+                    seed=seed + i if seed is not None else None,
+                )
+
+                if task_config is not None:
+                    tasks.append(task_config)
+                else:
+                    logger.warning(f"Failed to create TaskConfig for iteration {i}")
+
+            return tasks
+
+        except Exception as e:
+            logger.error(f"Failed to sample leaderboard scenarios: {e}")
+            return []
+
     # ------------------------------------------------------------------
     #  Conversion helpers
     # ------------------------------------------------------------------
