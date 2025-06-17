@@ -18,6 +18,7 @@ from carla_gym.engine.actors.ego.handler import EgoVehicleHandler
 from carla_gym.engine.actors.npc.vehicle import NpcVehicleHandler
 from carla_gym.engine.actors.npc.walker import NpcWalkerHandler
 from carla_gym.engine.actors.scenario_actor.scenario_actor_handler import ScenarioActorHandler
+from carla_gym.engine.navigation.route_generator import RandomRouteGenerator
 from carla_gym.engine.observation.obs_manager_handler import ObsManagerHandler
 from carla_gym.envs.task_config import TaskConfig
 from carla_gym.runtime.carla_runtime import CarlaRuntime
@@ -28,51 +29,7 @@ from carla_gym.utils.traffic_light import TrafficLightHandler
 logger = setup_logger(__name__)
 
 
-class CarlaEnv(gym.Env):
-    metadata = {"render_modes": ["human", "rgb_array"]}
-
-    def __init__(
-        self,
-        map_name: str = "Town01",
-        *,
-        host: str = "localhost",
-        seed: int = 2025,
-        gpu_id: int = 0,
-        no_rendering: bool = False,
-        nullrhi: bool = False,
-        obs_configs: dict | None = None,
-        reward_configs: dict | None = None,
-        terminal_configs: dict | None = None,
-        task_config: TaskConfig | None = None,
-        render_mode: Literal["human", "rgb_array"] = "rgb_array",
-    ):
-        self._map_name = map_name
-        self._host = host
-        self._seed = seed
-        self._gpu_id = gpu_id
-        self._no_rendering = no_rendering
-        self._nullrhi = nullrhi
-
-        # Set configs and tasks. If not provided, use empty dict.
-        self._obs_configs = obs_configs or {}
-        self._reward_configs = reward_configs or {}
-        self._terminal_configs = terminal_configs or {}
-        self._task_config = task_config or TaskConfig.sample(n=1)
-
-        self._observation_space = None
-        self._action_space = None
-
-        # FPS tracking
-        self._step_times = []
-        self._last_fps_log = 0
-        self._start_time = time.time()
-
-        # Public attributes
-        self.name = self.__class__.__name__
-        self.render_mode = render_mode
-
-        self._setup()
-
+class PropertyMixin:
     @property
     def observation_space(self) -> gym.spaces.Dict:
         if self._observation_space is None:
@@ -131,6 +88,53 @@ class CarlaEnv(gym.Env):
     def num_npc_walkers(self) -> int:
         return self._task["num_npc_walkers"]
 
+
+class CarlaEnv(PropertyMixin, gym.Env):
+    metadata = {"render_modes": ["human", "rgb_array"]}
+
+    def __init__(
+        self,
+        map_name: str = "Town01",
+        *,
+        host: str = "localhost",
+        seed: int = 2025,
+        gpu_id: int = 0,
+        no_rendering: bool = False,
+        nullrhi: bool = False,
+        obs_configs: dict | None = None,
+        reward_configs: dict | None = None,
+        terminal_configs: dict | None = None,
+        task_config: TaskConfig | None = None,
+        render_mode: Literal["human", "rgb_array"] = "rgb_array",
+    ):
+        super().__init__()
+        self._map_name = map_name
+        self._host = host
+        self._seed = seed
+        self._gpu_id = gpu_id
+        self._no_rendering = no_rendering
+        self._nullrhi = nullrhi
+
+        # Set configs and tasks. If not provided, use empty dict.
+        self._obs_configs = obs_configs or {}
+        self._reward_configs = reward_configs or {}
+        self._terminal_configs = terminal_configs or {}
+        self._task_config = task_config or TaskConfig.sample(n=1)
+
+        self._observation_space = None
+        self._action_space = None
+
+        # FPS tracking
+        self._step_times = []
+        self._last_fps_log = 0
+        self._start_time = time.time()
+
+        # Public attributes
+        self.name = self.__class__.__name__
+        self.render_mode = render_mode
+
+        self._setup()
+
     def reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple:
         """Reset the environment and return the first observation."""
         if seed is not None:
@@ -138,6 +142,17 @@ class CarlaEnv(gym.Env):
             self._rng = np.random.default_rng(self._seed)
 
         options = options or {}
+
+        # Route resampling (default True)
+        if options.get("resample_route", True):
+            self._task_config.keypoints = []
+            # Clear cached routes to force regeneration
+            self._task_config.ego_vehicles.routes["hero"] = (
+                [] if hasattr(self._task_config.ego_vehicles, "routes") else None
+            )
+
+        # Ensure route present (may regenerate)
+        self._ensure_route()
 
         if "gpu_id" in options:
             self._gpu_id = options["gpu_id"]
@@ -330,6 +345,9 @@ class CarlaEnv(gym.Env):
         self._logger_thread = threading.Thread(target=self._async_logger_loop, daemon=True)
         self._logger_thread.start()
 
+        # Ensure route exists for first episode
+        self._ensure_route()
+
     def _init_handlers(self) -> None:
         self._om_handler = ObsManagerHandler(self._obs_configs)
         self._ev_handler = EgoVehicleHandler(self._runtime.client, self._reward_configs, self._terminal_configs)
@@ -346,12 +364,11 @@ class CarlaEnv(gym.Env):
 
         total_requested = _requested(self._task["num_npc_vehicles"]) + _requested(self._task["num_npc_walkers"])
 
-        world = self._runtime.world
-        spawn_points = world.get_map().get_spawn_points()
+        spawn_points = self._runtime.get_map().get_spawn_points()
         total_spawn = len(spawn_points)
 
-        veh_cnt = len(world.get_actors().filter("*vehicle*"))
-        wlk_cnt = len(world.get_actors().filter("*walker.pedestrian*"))
+        veh_cnt = len(self._runtime.world.get_actors().filter("*vehicle*"))
+        wlk_cnt = len(self._runtime.world.get_actors().filter("*walker.pedestrian*"))
         ego_cnt = len(getattr(self._ev_handler, "ego_vehicles", {}))
 
         occupied = veh_cnt + wlk_cnt + ego_cnt
@@ -390,7 +407,7 @@ class CarlaEnv(gym.Env):
         TrafficLightHandler.reset(self._runtime.world)
 
         # Ensure hero route is converted to carla.Transform before spawning ego
-        self._task_config.resolve_routes(self._runtime.world.get_map())
+        self._task_config.resolve_routes(self._runtime.get_map())
         # Reflect the resolved route into the plain-dict copy
         self._task["ego_vehicles"]["routes"]["hero"] = self._task_config.ego_vehicles.routes["hero"]
 
@@ -552,3 +569,17 @@ class CarlaEnv(gym.Env):
     def _clean(self) -> None:
         self._clean_handlers()
         self._runtime.world.tick()
+
+    def _ensure_route(self) -> None:
+        """Generate route if TaskConfig.keypoints are empty."""
+
+        if self._task_config.ego_vehicles.routes.get("hero"):
+            return  # already resolved
+
+        if not self._task_config.keypoints:
+            gen = RandomRouteGenerator(self._runtime.get_map(), rng=self._rng, min_len=1000.0, lane_change_prob=0.0)
+            wps = gen.generate()
+            self._task_config.keypoints = [(t.location.x, t.location.y, t.location.z) for t in wps]
+
+        # Convert to Transform list
+        self._task_config.resolve_routes(self._runtime.get_map())

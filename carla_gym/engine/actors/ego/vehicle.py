@@ -57,9 +57,6 @@ class EgoVehicle:
         self._spawn_transforms = spawn_transforms
 
         self._endless = endless
-        if len(self._target_transforms) == 0:
-            while self._route_length < 1000.0:
-                self._add_random_target()
 
         self._last_route_location = self.vehicle.get_location()
         self.collision_px = False

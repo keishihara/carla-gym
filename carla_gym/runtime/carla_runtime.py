@@ -75,6 +75,16 @@ class CarlaRuntime:
     def no_rendering_mode(self) -> bool:
         return self._no_rendering_mode
 
+    def get_map(self) -> carla.Map:
+        if not self._client.is_initialized:
+            raise RuntimeError("Client is not initialized")
+        return self._client.carla_map
+
+    def reload_world(self, map_name: str | None = None) -> None:
+        if not self._client.is_initialized:
+            raise RuntimeError("Client is not initialized")
+        self._client.reload_world(map_name)
+
     def set_gpu_id(self, gpu_id: int) -> None:
         if gpu_id == self._server.gpu_index:
             return

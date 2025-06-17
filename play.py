@@ -7,8 +7,6 @@ from PIL import Image
 from carla_gym.envs.task_config import TaskConfig
 from carla_gym.wrappers.simple_state_action_wrapper import SimpleStateActionWrapper
 
-# from carla_gym.wrappers.simple_state_action_wrapper_back import SimpleStateActionWrapper
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -32,8 +30,8 @@ def main():
         num_npc_vehicles=0,
         num_npc_walkers=0,
         seed=args.seed,
-        route_file="/home/keishi_ishihara/workspace/carla-gym/packages/carla_garage/leaderboard/data/bench2drive220_1833.xml",
-        route_id="1833",
+        # route_file="/home/keishi_ishihara/workspace/carla-gym/packages/carla_garage/leaderboard/data/bench2drive220_1833.xml",
+        # route_id="1833",
     )
 
     env = None

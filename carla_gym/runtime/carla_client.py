@@ -32,6 +32,7 @@ class CarlaClientManager:
         self.client: carla.Client | None = None
         self.world: carla.World | None = None
         self.tm: carla.TrafficManager | None = None
+        self.carla_map: carla.Map | None = None
 
         self._client_initialized = False
 
@@ -142,6 +143,8 @@ class CarlaClientManager:
         self.client = client
         self.world = world
         self.tm = tm
+        self.carla_map = world.get_map()
+
         self._client_initialized = True
 
         self.set_sync_mode(True)
@@ -183,6 +186,21 @@ class CarlaClientManager:
         settings.no_rendering_mode = no_rendering
         self.world.apply_settings(settings)
 
+    def reload_world(self, map_name: str | None = None) -> None:
+        """Reload the current map or load a new map."""
+        if not self._client_initialized:
+            raise RuntimeError("Client not initialized")
+
+        if map_name is None:
+            # Reload current map
+            current_map_name = self.carla_map.name if self.carla_map else "Town01"
+        else:
+            current_map_name = map_name
+
+        self.world = self.client.load_world(current_map_name)
+        self.carla_map = self.world.get_map()
+        logger.info(f"World reloaded: {current_map_name}")
+
     def close(self) -> None:
         if not self._client_initialized:
             logger.debug("Client not initialized. Skipping close.")
@@ -201,6 +219,7 @@ class CarlaClientManager:
         self.client = None
         self.world = None
         self.tm = None
+        self.carla_map = None
         self._client_initialized = False
 
     def is_connection_healthy(self) -> bool:
