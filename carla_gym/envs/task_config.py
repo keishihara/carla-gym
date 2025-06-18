@@ -252,14 +252,15 @@ class TaskConfig:
     num_npc_vehicles: int | tuple[int, int]
     num_npc_walkers: int | tuple[int, int]
     ego_vehicles: EgoVehiclesConfig = field(default_factory=EgoVehiclesConfig)
-    route_file: str | None = None
-    route_id: str | None = None
     scenarios: list[ScenarioConfig] = field(default_factory=list)
     # Route waypoints kept as plain floats for pickling safety. Each entry is
     # (x, y, z).  They are converted to ``carla.Transform`` objects by
     # :py:meth:`resolve_routes` immediately before the episode starts.
     keypoints: list[tuple[float, float, float]] = field(default_factory=list)
     seed: int | None = None
+
+    route_file: str | None = None
+    route_id: str | None = None
 
     # ------------------------------------------------------------------
     #  Post-processing

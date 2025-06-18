@@ -84,7 +84,6 @@ class RandomRouteGenerator:
             if not next_wps:
                 # Dead-end: abort this trial
                 raise RuntimeError("Dead end reached")
-
             # Handle intersections
             if len(next_wps) > 1:
                 curr_wp = self._rng.choice(next_wps)
